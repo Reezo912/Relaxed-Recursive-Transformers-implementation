@@ -242,6 +242,7 @@ def evaluate_student(
     chunk_tokens: int = 256,
 ) -> tuple[float, float, float]:
     """Evaluate validation CE, KL(teacher || student), and perplexity using chunked logits."""
+    was_training = student.training
     student.eval()
     teacher.eval()
     total_ce = 0.0
@@ -276,7 +277,8 @@ def evaluate_student(
     mean_ce = total_ce / max(total_toks, 1)
     mean_kl = total_kl / max(total_toks, 1)
     ppl = math.exp(min(mean_ce, 20.0))
-    student.train()
+    if was_training:
+        student.train()
     return mean_ce, mean_kl, ppl
 
 
@@ -565,10 +567,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta1", type=float, default=0.9, help="Momentum beta1 for bf16-adafactor")
     parser.add_argument("--lr-schedule", choices=["cosine", "wsd"], default="wsd", help="LR schedule (cosine or Warmup-Stable-Decay)")
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
-    parser.add_argument("--kl-weight", type=float, default=0.9)
-    parser.add_argument("--ce-weight", type=float, default=0.1)
+    parser.add_argument("--kl-weight", type=float, default=0.85)
+    parser.add_argument("--ce-weight", type=float, default=0.15)
     parser.add_argument("--kl-temp", type=float, default=1.5)
-    parser.add_argument("--kl-type", choices=["forward", "jsd"], default="jsd", help="forward KL or Generalized JSD (GKD/DistiLLM)")
+    parser.add_argument("--kl-type", choices=["forward", "jsd"], default="forward", help="forward KL (recommended for RRT recovery) or Generalized JSD")
     parser.add_argument("--jsd-beta", type=float, default=0.5, help="Beta for JSD_beta (0.5=symmetric GKD, 0.1=skew-reverse DistiLLM)")
     parser.add_argument("--hidden-weight", type=float, default=2.0, help="Layerwise hidden-state alignment weight (same-arch teacher)")
     parser.add_argument(
@@ -577,21 +579,22 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="DSKD training-only linear projectors (student_dim -> teacher_dim) for cross-architecture hidden alignment",
     )
-    parser.add_argument("--cross-arch-taps", type=int, default=6, help="Number of matched depth taps for cross-arch projector")
-    parser.add_argument("--cross-arch-hidden-weight", type=float, default=1.0, help="Loss weight for cross-arch hidden alignment")
+    parser.add_argument("--cross-arch-taps", type=int, default=6, help="Number of matched interior depth taps for cross-arch projector")
+    parser.add_argument("--cross-arch-hidden-weight", type=float, default=0.25, help="Loss weight for cross-arch hidden alignment")
     parser.add_argument(
         "--on-policy-every",
         type=int,
         default=0,
-        help="Run an On-Policy Distillation rollout step every N steps (0=off; recommended 12 in Stage 2)",
+        help="Accumulate an On-Policy Distillation rollout gradient into the main step every N steps (0=off)",
     )
-    parser.add_argument("--on-policy-batch", type=int, default=4, help="Number of prompts per On-Policy rollout")
-    parser.add_argument("--on-policy-tokens", type=int, default=96, help="Max generated tokens per On-Policy rollout")
-    parser.add_argument("--on-policy-jsd-beta", type=float, default=0.1, help="Reverse-skewed JSD beta for On-Policy rollouts")
+    parser.add_argument("--on-policy-batch", type=int, default=2, help="Number of prompts per On-Policy rollout")
+    parser.add_argument("--on-policy-tokens", type=int, default=64, help="Max generated tokens per On-Policy rollout")
+    parser.add_argument("--on-policy-jsd-beta", type=float, default=0.5, help="JSD beta for On-Policy rollouts (0.5=symmetric)")
+    parser.add_argument("--on-policy-weight", type=float, default=0.15, help="Gradient weight for accumulated OPD rollout inside main step")
     parser.add_argument("--ema-start", type=float, default=0.70, help="Progress fraction to start zero-VRAM CPU Weight EMA (>=1.0 disables)")
     parser.add_argument("--ema-decay", type=float, default=0.95, help="CPU EMA decay (0.0=uniform SWA, 0.95=exponential moving average)")
     parser.add_argument("--ema-every", type=int, default=5, help="Update CPU EMA every N steps once active")
-    parser.add_argument("--chunk-tokens", type=int, default=128)
+    parser.add_argument("--chunk-tokens", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=512)
@@ -789,6 +792,7 @@ def main() -> None:
             student_layers=student.config.num_hidden_layers,
             teacher_layers=teacher.config.num_hidden_layers,
             num_taps=args.cross_arch_taps,
+            include_final=False,
         )
         hidden_projector = CrossArchHiddenProjector(
             student_dim=student.config.hidden_size,
@@ -896,12 +900,27 @@ def main() -> None:
     t_ch_ce, _, t_ch_ppl = evaluate_student(teacher, teacher, chat_val_blocks, args.batch_size, device, args.chunk_tokens)
     s_wt_ce, s_wt_kl, s_wt_ppl = evaluate_student(student, teacher, wt_val_blocks, args.batch_size, device, args.chunk_tokens)
     s_ch_ce, s_ch_kl, s_ch_ppl = evaluate_student(student, teacher, chat_val_blocks, args.batch_size, device, args.chunk_tokens)
+    step0_mean_kl = 0.5 * (s_wt_kl + s_ch_kl)
     print(f"[Teacher {teacher_name} ({t_mode})] wt_ppl={t_wt_ppl:.2f} | chat_ppl={t_ch_ppl:.2f}", flush=True)
     print(
         f"[Student step {start_step}] wt_ppl={s_wt_ppl:.2f} (kl={s_wt_kl:.3f}) | "
-        f"chat_ppl={s_ch_ppl:.2f} (kl={s_ch_kl:.3f}) | mean_kl={0.5*(s_wt_kl+s_ch_kl):.4f}",
+        f"chat_ppl={s_ch_ppl:.2f} (kl={s_ch_kl:.3f}) | mean_kl={step0_mean_kl:.4f}",
         flush=True,
     )
+    if init_from_ckpt is not None and not is_resuming:
+        # Never overwrite best.pt with a checkpoint worse than the Stage-1 starting point
+        best_val_kl = step0_mean_kl
+        save_checkpoint(
+            best_ckpt,
+            student,
+            optimizer,
+            start_step,
+            tokens_seen,
+            prior_elapsed,
+            best_val_kl,
+            args,
+            projector=hidden_projector,
+        )
 
     sample_prompts = [
         "Explain how HTTPS encryption works to a 12-year-old in two short sentences.",
@@ -963,11 +982,12 @@ def main() -> None:
             }
         )
 
+    data_seed = args.seed + start_step + (10000 if init_from_ckpt is not None else 0)
     loader = PackedStreamLoader(
-        tokenizer, seq_len=args.seq_len, sources=data_sources, weights=mix_weights, seed=args.seed + start_step
+        tokenizer, seq_len=args.seq_len, sources=data_sources, weights=mix_weights, seed=data_seed
     )
     prompt_stream: _PromptStream | None = (
-        _PromptStream(data_sources["chat"][0], tokenizer, seed=args.seed + 5555 + start_step)
+        _PromptStream(data_sources["chat"][0], tokenizer, seed=data_seed + 5555)
         if args.on_policy_every > 0 and "chat" in data_sources
         else None
     )
@@ -987,7 +1007,11 @@ def main() -> None:
         )
     )
     kl_desc = f"JSD(b={args.jsd_beta})" if args.kl_type == "jsd" else "FwdKL"
-    opd_desc = f"every {args.on_policy_every} (b={args.on_policy_batch}, tok={args.on_policy_tokens}, jsd={args.on_policy_jsd_beta})" if prompt_stream is not None else "OFF"
+    opd_desc = (
+        f"every {args.on_policy_every} (b={args.on_policy_batch}, tok={args.on_policy_tokens}, jsd={args.on_policy_jsd_beta}, w={args.on_policy_weight})"
+        if prompt_stream is not None
+        else "OFF"
+    )
     ema_desc = f"start@{int(args.ema_start*100)}% (decay={args.ema_decay}, every={args.ema_every})" if ema is not None else "OFF"
     print(
         f"\nStarting distillation: budget={args.max_hours:.2f}h (max_steps={args.max_steps or 'time-based'}), "
@@ -1080,6 +1104,9 @@ def main() -> None:
                     step_hid += hid_loss.item() / args.grad_accum
                     aux_loss = (args.cross_arch_hidden_weight * hid_loss) / args.grad_accum
 
+                # Release all unused intermediate teacher/student hidden tuples before peak-VRAM logit chunks
+                del t_out, t_hiddens, s_out
+
                 ce_val, kl_val = chunked_kl_ce_backward(
                     student_hidden=s_hidden,
                     teacher_hidden=t_hidden,
@@ -1095,22 +1122,16 @@ def main() -> None:
                     kl_type=args.kl_type,
                     jsd_beta=args.jsd_beta,
                 )
+                del s_hidden, t_hidden, aux_loss, batch
                 step_ce += ce_val / args.grad_accum
                 step_kl += kl_val / args.grad_accum
 
-            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-            optimizer.step()
-
-            step += 1
-            tokens_seen += eff_toks_per_step
-            win_ce += step_ce
-            win_kl += step_kl
-            win_hid += step_hid
-            win_n += 1
-
-            # Optional On-Policy Distillation rollout step (student generates -> teacher grades with JSD_beta)
-            if prompt_stream is not None and step % args.on_policy_every == 0:
-                optimizer.zero_grad(set_to_none=True)
+            # Optional On-Policy Distillation: accumulate weighted gradient into this same optimizer step
+            # (never take an unaveraged full-LR optimizer.step() on a tiny 128-token rollout alone).
+            opd_toks = 0
+            opd_jsd = 0.0
+            next_step = step + 1
+            if prompt_stream is not None and args.on_policy_weight > 0.0 and next_step % args.on_policy_every == 0:
                 opd_prompts = prompt_stream.next_prompts(args.on_policy_batch)
                 opd_jsd, opd_toks = run_on_policy_distill_step(
                     student=student,
@@ -1122,14 +1143,20 @@ def main() -> None:
                     temperature=args.kl_temp,
                     jsd_beta=args.on_policy_jsd_beta,
                     chunk_tokens=args.chunk_tokens,
-                    kl_weight=1.0,
+                    kl_weight=args.on_policy_weight,
                 )
-                if opd_toks > 0:
-                    torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-                    optimizer.step()
-                    tokens_seen += opd_toks
-                    if step % (args.on_policy_every * 2) == 0 or step == args.on_policy_every:
-                        print(f"  [OPD step {step:5d}] gen_toks={opd_toks:4d} | opd_jsd={opd_jsd:.4f}", flush=True)
+
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            optimizer.step()
+
+            step = next_step
+            tokens_seen += eff_toks_per_step + opd_toks
+            win_ce += step_ce
+            win_kl += step_kl
+            win_hid += step_hid
+            win_n += 1
+            if opd_toks > 0 and (step % (args.on_policy_every * 2) == 0 or step == args.on_policy_every):
+                print(f"  [OPD step {step:5d}] gen_toks={opd_toks:4d} | opd_jsd={opd_jsd:.4f}", flush=True)
 
             # Zero-VRAM CPU Weight EMA update during late training / WSD decay
             if ema is not None and progress >= args.ema_start and step % args.ema_every == 0:

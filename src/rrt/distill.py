@@ -172,16 +172,23 @@ def compute_matched_layer_pairs(
     student_layers: int,
     teacher_layers: int,
     num_taps: int = 6,
+    include_final: bool = True,
 ) -> list[tuple[int, int]]:
     """Map evenly spaced relative depths between student and teacher hidden_states tuples.
 
     Note: HF ``output_hidden_states=True`` has index 0 = embeddings and index L = final layer output.
+    When ``include_final=False``, taps are spread strictly across interior layers ``1 .. L-1``
+    so cross-architecture hidden alignment does not pull the student's final hidden state away
+    from its own frozen ``lm_head``.
     """
     pairs: list[tuple[int, int]] = []
     seen: set[tuple[int, int]] = set()
+    s_max = student_layers if include_final else max(1, student_layers - 1)
+    t_max = teacher_layers if include_final else max(1, teacher_layers - 1)
+    denom = num_taps if include_final else (num_taps + 1)
     for k in range(1, num_taps + 1):
-        s_idx = max(1, min(student_layers, round(student_layers * k / num_taps)))
-        t_idx = max(1, min(teacher_layers, round(teacher_layers * k / num_taps)))
+        s_idx = max(1, min(s_max, round(student_layers * k / denom)))
+        t_idx = max(1, min(t_max, round(teacher_layers * k / denom)))
         pair = (s_idx, t_idx)
         if pair not in seen:
             seen.add(pair)

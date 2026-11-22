@@ -321,6 +321,9 @@ def test_chunked_kl_token_mask_matches_masked_reference_exact() -> None:
 def test_cross_arch_hidden_projector_maps_layers_and_backpropagates() -> None:
     pairs = compute_matched_layer_pairs(student_layers=28, teacher_layers=36, num_taps=6)
     assert pairs == [(5, 6), (9, 12), (14, 18), (19, 24), (23, 30), (28, 36)]
+    interior_pairs = compute_matched_layer_pairs(student_layers=28, teacher_layers=36, num_taps=6, include_final=False)
+    assert len(interior_pairs) == 6
+    assert all(s < 28 and t < 36 for s, t in interior_pairs)
 
     torch.manual_seed(5)
     proj = CrossArchHiddenProjector(student_dim=32, teacher_dim=48, num_taps=len(pairs), dtype=torch.float32)

@@ -22,18 +22,22 @@ uv run python scripts/distill.py \
   --no-adaptive-rank \
   --dora-scale \
   --kl-type forward \
+  --kl-weight 0.9 \
+  --ce-weight 0.1 \
   --lr-schedule wsd \
   --hidden-weight 2.0 \
   --lr 1.5e-4 \
   --lora-lr-mult 2.0 \
+  --chunk-tokens 256 \
   --ema-start 0.70 \
   --ema-decay 0.95 \
   --max-hours 0.6 \
   --eval-interval 200 \
+  --seed 42 \
   --out-dir checkpoints/qwen3_1.7b_rrt_s1 \
   2>&1 | tee checkpoints/qwen3_1.7b_rrt_s1.log
 
-echo "=== Stage 2: Strong-to-Weak Qwen3-4B int8 (DSKD Ridge + JSD beta=0.25 + On-Policy + WSD + CPU-EMA) ==="
+echo "=== Stage 2: Strong-to-Weak Qwen3-4B int8 (Forward KL + Interior DSKD Ridge + WSD + CPU-EMA) ==="
 uv run python scripts/distill.py \
   --model Qwen/Qwen3-1.7B \
   --init-from checkpoints/qwen3_1.7b_rrt_s1/best.pt \
@@ -42,20 +46,21 @@ uv run python scripts/distill.py \
   --dataset-mix elite \
   --no-adaptive-rank \
   --dora-scale \
-  --kl-type jsd \
-  --jsd-beta 0.25 \
+  --kl-type forward \
+  --kl-weight 0.85 \
+  --ce-weight 0.15 \
+  --kl-temp 1.5 \
   --lr-schedule wsd \
   --cross-arch-hidden \
-  --cross-arch-hidden-weight 1.0 \
-  --on-policy-every 12 \
-  --on-policy-batch 2 \
-  --on-policy-tokens 64 \
-  --on-policy-jsd-beta 0.1 \
-  --lr 1.0e-4 \
-  --lora-lr-mult 2.0 \
+  --cross-arch-hidden-weight 0.25 \
+  --on-policy-every 0 \
+  --lr 6.0e-5 \
+  --lora-lr-mult 1.5 \
+  --chunk-tokens 256 \
   --ema-start 0.70 \
   --ema-decay 0.95 \
   --max-hours 1.5 \
   --eval-interval 150 \
+  --seed 1337 \
   --out-dir checkpoints/qwen3_1.7b_rrt_s2_4b \
   2>&1 | tee checkpoints/qwen3_1.7b_rrt_s2_4b.log
