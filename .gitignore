@@ -1,0 +1,32 @@
+# Python & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model checkpoints, datasets, and training logs
+checkpoints/
+data/
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.ckpt
+*.log
+*.jsonl
+
+# OS & editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
